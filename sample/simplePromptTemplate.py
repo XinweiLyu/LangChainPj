@@ -33,7 +33,7 @@ def demo_partial_prompt_template() -> None:
     # partial_variables：固定/自动填充部分占位符，format 时只需传其余变量
     template = PromptTemplate(
         template="今天是{date}，请告诉我关于{topic}的最新消息。",
-        input_variables=["topic"],
+        input_variables=["topic"], # 输入变量
         partial_variables={
             "date": datetime.now().strftime("%Y年%m月%d日")  # 自动填充
         },
