@@ -117,6 +117,7 @@ class VectorDatabaseManager:
         except Exception as e:
             logger.error(f"加载DashScope模型失败: {e}")
             logger.warning("使用备用HuggingFace模型")
+            # 备用HuggingFace模型,加载本机模型 sentence-transformers/all-MiniLM-L6-v2，并在 CPU 上
             self.embeddings = HuggingFaceEmbeddings(
                 model_name="sentence-transformers/all-MiniLM-L6-v2",
                 model_kwargs={'device': 'cpu'}
@@ -135,6 +136,7 @@ class VectorDatabaseManager:
     def _load_existing_db(self):
         """加载已存在的Milvus集合"""
         try:
+            # 检查集合是否存在
             if utility.has_collection(self.collection_name):
                 try:
                     self.vectorstore = Milvus(
@@ -175,7 +177,7 @@ class VectorDatabaseManager:
             else:
                 loader = TextLoader(file_path, encoding='utf-8')
                 logger.warning(f"未识别的文件类型 {file_extension}, 使用文本加载器")
-
+            # 加载文档，返回Document列表，每个Document包含page_content: str和metadata: dict
             documents = loader.load()
             logger.info(f"成功加载文档: {file_path}, 共 {len(documents)} 个文档块")
             return documents
@@ -188,6 +190,7 @@ class VectorDatabaseManager:
         """切分文档"""
         # ... (代码与之前版本相同)
         try:
+            # 调用text_splitter，把长文档切成几百个小片段
             split_docs = self.text_splitter.split_documents(documents)
             logger.info(f"文档切分完成: {len(documents)} -> {len(split_docs)} 个块")
             return split_docs
@@ -206,7 +209,7 @@ class VectorDatabaseManager:
         if not documents:
             logger.warning("没有文档需要添加")
             return
-
+        # 目标集合名
         target_collection = collection_name or self.collection_name
 
         try:
@@ -296,11 +299,14 @@ class VectorDatabaseManager:
         """
         try:
             logger.info(f"开始处理文件: {file_path}")
+            # 加载文档
             documents = self.load_document(file_path)
             if not documents:
                 return False
 
+            # 切分文档
             split_docs = self.split_documents(documents)
+            # 将文档添加到Milvus数据库
             self.add_documents_to_db(split_docs, collection_name)
 
             logger.info(f"文件处理完成: {file_path}")
@@ -319,6 +325,7 @@ class VectorDatabaseManager:
         Args:
             csv_path: CSV文件路径
             text_columns: 需要向量化的文本列名列表
+            metadata_columns: 需要向量化的元数据列名列表 ，知道「这条向量对应哪条业务记录」
 
         Returns:
             处理是否成功
@@ -327,37 +334,41 @@ class VectorDatabaseManager:
             import pandas as pd
             df = pd.read_csv(csv_path, encoding='utf-8')
             logger.info(f"读取CSV文件: {csv_path}, 共 {len(df)} 行数据")
+            # 如果text_columns为空，则从df的列名中找到所有object类型的列，并去掉以Unnamed开头的列
             if text_columns is None or not text_columns:
                 object_cols = [c for c in df.columns if df[c].dtype == 'object']
                 text_columns = [c for c in object_cols if not str(c).startswith('Unnamed')]
-
+            # 如果metadata_columns为空，则从df的列名中找到所有不在text_columns中的列
             if metadata_columns is None:
                 metadata_columns = [c for c in df.columns if c not in text_columns]
-
-            documents = []
+           
+            documents = [] 
+            # 遍历df的每一行 ，构建Document对象
             for idx, row in df.iterrows():
-                content_parts = []
-                metadata = {"source": csv_path, "row_index": idx}
-
-                for col in text_columns:
-                    if pd.notna(row[col]):
-                        text = str(row[col]).strip()
+                content_parts = [] # 内容部分. 列名: 单元格内容
+                metadata = {"source": csv_path, "row_index": idx} # 元数据
+                
+                # 循环获取每一行的单元格内容
+                for col in text_columns:  # col 是表头
+                    if pd.notna(row[col]): 
+                        text = str(row[col]).strip()   # row[col] 是单元格内容
                         if text:
-                            content_parts.append(f"{col}: {text}")
-
+                            content_parts.append(f"{col}: {text}") # 表头: 单元格内容 eg row 1 => id: 1， category: 1， question: 1， answer: 1
+                
+                # metadata 
                 for col in metadata_columns:
-                    val = row.get(col)
+                    val = row.get(col) # row.get(col) 是单元格内容
                     if pd.notna(val):
-                        metadata[str(col)] = str(val)
+                        metadata[str(col)] = str(val) 
 
-                if content_parts:
+                if content_parts: 
                     content = "\n".join(content_parts)
-                    doc = Document(page_content=content, metadata=metadata)
+                    doc = Document(page_content=content, metadata=metadata) # 创建一个Document对象  page_content: str和metadata: dict
                     documents.append(doc)
 
             logger.info(f"构建了 {len(documents)} 个文档")
-            split_docs = self.split_documents(documents)
-            self.add_documents_to_db(split_docs)
+            split_docs = self.split_documents(documents) # 切分文档
+            self.add_documents_to_db(split_docs) # 将文档添加到Milvus数据库
 
             return True
 
