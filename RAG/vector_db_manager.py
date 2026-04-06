@@ -36,7 +36,14 @@ from langchain_community.document_loaders import (
     Docx2txtLoader,
     UnstructuredExcelLoader
 )
-from pymilvus import utility, connections, Collection, DataType
+from pymilvus import (
+    utility,
+    connections,
+    Collection,
+    CollectionSchema,
+    DataType,
+    FieldSchema,
+)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -186,6 +193,76 @@ class VectorDatabaseManager:
                 break
 
         return vector_field, text_field, metric_type
+
+    def _create_collection_orm(self, collection_name: str) -> None:
+        """使用 ORM 创建与 upload_document / 现有项目一致的集合（避免 langchain_milvus 连接 bug）。"""
+        dim = len(self.embeddings.embed_query("ping"))
+        fields = [
+            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+            FieldSchema(name="name", dtype=DataType.VARCHAR, max_length=255),
+            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=5000),
+            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim),
+        ]
+        schema = CollectionSchema(fields=fields, description="文本嵌入集合")
+        col = Collection(name=collection_name, schema=schema, using="default")
+        col.create_index(
+            field_name="embedding",
+            index_params={"index_type": "AUTOINDEX", "metric_type": "L2", "params": {}},
+        )
+        logger.info(f"已创建集合 {collection_name}，向量维度={dim}")
+
+    def _insert_documents_via_orm(
+        self, documents: List[Document], collection_name: str
+    ) -> None:
+        """使用 default 连接与 Collection.insert 写入，不经过 langchain_milvus.Milvus。"""
+        self._ensure_connection()
+        col = Collection(collection_name, using="default")
+        vector_field, text_field, _ = self._infer_orm_search_schema(col)
+
+        dim = int(
+            next(
+                f.params["dim"]
+                for f in col.schema.fields
+                if f.dtype == DataType.FLOAT_VECTOR
+            )
+        )
+        texts_raw = [(doc.page_content or "") for doc in documents]
+        vectors = self.embeddings.embed_documents(texts_raw)
+        if vectors and len(vectors[0]) != dim:
+            raise ValueError(
+                f"嵌入维度 {len(vectors[0])} 与集合向量字段维度 {dim} 不一致"
+            )
+
+        data_columns: List[List[Any]] = []
+        for f in col.schema.fields:
+            if f.is_primary and getattr(f, "auto_id", False):
+                continue
+            max_len = int(f.params.get("max_length", 65535))
+            if f.dtype == DataType.FLOAT_VECTOR:
+                data_columns.append(vectors)
+            elif f.dtype == DataType.VARCHAR:
+                if f.name == text_field:
+                    data_columns.append(
+                        [t if len(t) <= max_len else t[:max_len] for t in texts_raw]
+                    )
+                elif f.name == "name":
+                    names = []
+                    for doc in documents:
+                        src = doc.metadata.get("source") or doc.metadata.get("name") or "document"
+                        names.append(os.path.basename(str(src))[:max_len])
+                    data_columns.append(names)
+                else:
+                    data_columns.append([""] * len(documents))
+            elif f.dtype == DataType.JSON:
+                data_columns.append(
+                    [json.dumps(doc.metadata, ensure_ascii=False) for doc in documents]
+                )
+            else:
+                raise ValueError(f"入库不支持字段: {f.name} ({f.dtype})")
+
+        col.insert(data_columns)
+        col.flush()
+        logger.info(f"已向集合 {collection_name} ORM 插入 {len(documents)} 条，已 flush")
 
     def _entity_row_to_dict(self, entity: Any, field_names: List[str]) -> Dict[str, Any]:
         """将 search 返回的 entity 转为 dict。"""
@@ -344,71 +421,29 @@ class VectorDatabaseManager:
 
         try:
             self._ensure_connection()
-            # 检查集合是否存在
             collection_exists = self._has_collection_with_retry(target_collection)
-
-            if self.vectorstore is None or self.collection_name != target_collection:
-                # 初始化 vectorstore
-                if collection_exists:
-                    logger.info(f"加载现有集合: {target_collection}")
-                else:
-                    logger.info(f"集合不存在，将创建新集合: {target_collection}")
-
-                # Milvus.from_documents 和 Milvus(...) 的区别：
-                # from_documents: 会根据文档内容创建集合（如果不存在），并插入数据。
-                # Milvus(...): 仅初始化客户端，不插入数据，通常用于检索或追加。
-
-                # 策略：始终使用 Milvus() 初始化，然后调用 add_documents。
-                # 如果是首次创建，我们需要先确保集合存在，或者让 add_documents 处理？
-                # LangChain 的 Milvus.from_documents 是最方便的初始化+插入入口。
-                # 但为了避免重复创建/Schema冲突，我们应该：
-                # 1. 如果集合存在，用 Milvus() 加载，然后 add_documents()
-                # 2. 如果集合不存在，用 Milvus.from_documents()
-
-                if collection_exists:
-                    self.vectorstore = Milvus(
-                        embedding_function=self.embeddings,
-                        collection_name=target_collection,
-                        connection_args=self._connection_args(),
-                        # 关键：auto_id=True 通常是默认的，但确保配置一致
-                    )
-                    self.collection_name = target_collection
-                    # 追加数据
-                    self.vectorstore.add_documents(documents)
-                    logger.info(f"成功向现有集合 '{target_collection}' 追加 {len(documents)} 条文档")
-                else:
-                    # 集合不存在，创建并插入
-                    self.vectorstore = Milvus.from_documents(
-                        documents=documents,
-                        embedding=self.embeddings,
-                        collection_name=target_collection,
-                        connection_args=self._connection_args(),
-                        drop_old=False  # 明确不删除旧的（虽然这里是else分支，本身就不存在）
-                    )
-                    self.collection_name = target_collection
-                    logger.info(f"成功创建集合 '{target_collection}' 并插入 {len(documents)} 条文档")
+            if not collection_exists:
+                logger.info(f"集合不存在，将创建: {target_collection}")
+                self._create_collection_orm(target_collection)
             else:
-                # vectorstore 已初始化且集合名称匹配，直接追加
-                self.vectorstore.add_documents(documents)
-                logger.info(f"成功向当前集合 '{target_collection}' 追加 {len(documents)} 条文档")
+                logger.info(f"加载现有集合: {target_collection}")
+
+            self._insert_documents_via_orm(documents, target_collection)
+            self.collection_name = target_collection
+            self.vectorstore = None
+            logger.info(f"成功向集合 '{target_collection}' 写入 {len(documents)} 条文档")
 
         except Exception as e:
-            # 捕获 Schema 不兼容错误并尝试自动修复（重建）
             msg = str(e)
             if "non-exist field" in msg or "inconsistent with defined schema" in msg:
-                logger.warning(f"检测到 Schema 不兼容 ({e})，尝试重建集合...")
+                logger.warning(f"检测到 Schema 不兼容 ({e})，尝试重建集合并 ORM 写入...")
                 try:
                     if self._has_collection_with_retry(target_collection):
-                        utility.drop_collection(target_collection)
-
-                    self.vectorstore = Milvus.from_documents(
-                        documents=documents,
-                        embedding=self.embeddings,
-                        collection_name=target_collection,
-                        connection_args=self._connection_args(),
-                        drop_old=True
-                    )
+                        utility.drop_collection(target_collection, using="default")
+                    self._create_collection_orm(target_collection)
+                    self._insert_documents_via_orm(documents, target_collection)
                     self.collection_name = target_collection
+                    self.vectorstore = None
                     logger.info(f"集合 '{target_collection}' 已重建并写入数据")
                 except Exception as re:
                     logger.error(f"重建集合失败: {re}")

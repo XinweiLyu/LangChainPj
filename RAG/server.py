@@ -3,14 +3,16 @@ import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
+# 先保证 RAG 目录在 path 中，再导入同目录下的 api_integration（支持直接 python server.py）
+_RAG_DIR = str(Path(__file__).resolve().parent)
+if _RAG_DIR not in sys.path:
+    sys.path.insert(0, _RAG_DIR)
+
 # Load environment variables
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
 from api_integration import register_vector_routes
-
-# 添加当前目录到 python path 以便导入模块
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from flask import Flask
 from flask_cors import CORS

@@ -6,6 +6,7 @@ API集成模块
 from flask import Blueprint, request, jsonify
 import os
 import logging
+import tempfile
 from typing import Dict, Any, List
 from werkzeug.utils import secure_filename
 from pathlib import Path
@@ -25,10 +26,9 @@ vector_bp = Blueprint('vector', __name__, url_prefix='/api/vector')
 vector_manager: VectorDatabaseManager = None
 vector_retriever: VectorRetriever = None
 
-# 临时上传目录
-UPLOAD_FOLDER = '/tmp/vector_uploads'
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
+# 临时上传目录（Windows 上不要用 /tmp，统一用系统临时目录）
+UPLOAD_FOLDER = os.path.join(tempfile.gettempdir(), "vector_uploads")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)

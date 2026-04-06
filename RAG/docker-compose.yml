@@ -1,0 +1,55 @@
+# 这个文件用于在本地启动 Milvus Standalone（含依赖 Etcd + MinIO）
+# 启动命令：docker compose up -d
+# 停止命令：docker compose down
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: milvus-etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: >
+      etcd
+      -advertise-client-urls=http://127.0.0.1:2379
+      -listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    volumes:
+      - ./volumes/etcd:/etcd
+
+  minio:
+    image: minio/minio:RELEASE.2024-01-11T07-46-16Z
+    container_name: milvus-minio
+    environment:
+      # 已修改默认凭据，避免使用官方默认账号密码
+      MINIO_ROOT_USER: test1234
+      MINIO_ROOT_PASSWORD: test1234
+    command: minio server /minio_data --console-address ":9001"
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # MinIO Console
+    volumes:
+      - ./volumes/minio:/minio_data
+
+  milvus:
+    # 与当前 Python 客户端（pymilvus 2.6.x）对齐
+    image: milvusdb/milvus:v2.6.0
+    container_name: milvus-standalone
+    command: ["milvus", "run", "standalone"]
+    depends_on:
+      - etcd
+      - minio
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      # 必须与下方 minio 服务的 MINIO_ROOT_USER / MINIO_ROOT_PASSWORD 一致。
+      # 否则 Milvus 仍用默认 minioadmin，会出现对象存储 ACCESS_DENIED，向量检索失败而 query 仍可能成功。
+      MINIO_ACCESS_KEY_ID: test1234
+      MINIO_SECRET_ACCESS_KEY: test1234
+    ports:
+      - "19530:19530"  # 你的 Python 项目连接这个端口
+      - "9091:9091"    # Milvus health / metrics
+    volumes:
+      - ./volumes/milvus:/var/lib/milvus
