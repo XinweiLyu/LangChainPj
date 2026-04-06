@@ -399,7 +399,7 @@ class VectorDatabaseManager:
             (文档, 相似度分数) 列表
         """
         target_collection = collection_name or self.collection_name
-
+        # 如果vectorstore未初始化，或者target_collection和collection_name不匹配，则加载集合
         if self.vectorstore is None or (target_collection and self.collection_name != target_collection):
             try:
                 if target_collection and utility.has_collection(target_collection):
