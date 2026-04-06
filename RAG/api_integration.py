@@ -14,9 +14,9 @@ from dotenv import load_dotenv
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-from .vector_db_manager import VectorDatabaseManager
-from .vector_retriever import VectorRetriever
-from .document_loader import DocumentLoader
+from vector_db_manager import VectorDatabaseManager
+from vector_retriever import VectorRetriever
+from document_loader import DocumentLoader
 
 # 创建蓝图
 vector_bp = Blueprint('vector', __name__, url_prefix='/api/vector')

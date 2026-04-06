@@ -18,7 +18,7 @@ from pymilvus import connections, Collection, CollectionSchema, DataType, FieldS
 load_dotenv()
 
 # --- 在这里定义您的配置参数 ---
-FILE_PATH = "rag.txt"  # <-- 替换为您的文件路径
+FILE_PATH = "cv.pdf"  # <-- 替换为您的文件路径
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "agent_rag")
 MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
 MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
@@ -32,6 +32,7 @@ class SimpleDocumentUploader:
     def __init__(self, host, port, collection_name, dashscope_api_key, embedding_model):
         self.host = host
         self.port = port
+        self.alias = "default"
         self.collection_name = collection_name
         self.dashscope_api_key = dashscope_api_key
         self.embedding_model = embedding_model
@@ -43,8 +44,8 @@ class SimpleDocumentUploader:
 
     def connect_milvus(self):
         """连接到Milvus数据库"""
-        connections.connect("default", host=self.host, port=self.port)
-        print(f"已连接到 Milvus，地址为 {self.host}:{self.port}")
+        connections.connect(alias=self.alias, host=self.host, port=self.port)
+        print(f"已连接到 Milvus，地址为 {self.host}:{self.port}, alias={self.alias}")
 
     def get_embedding(self, texts):
         """生成文本嵌入向量"""
@@ -66,9 +67,9 @@ class SimpleDocumentUploader:
 
     def create_collection_if_not_exists(self):
         """创建集合（如果不存在）"""
-        if not utility.has_collection(self.collection_name):
+        if not utility.has_collection(self.collection_name, using=self.alias):
             schema = self.get_schema()
-            collection = Collection(name=self.collection_name, schema=schema)
+            collection = Collection(name=self.collection_name, schema=schema, using=self.alias)
 
             # 创建索引
             index_params = {
@@ -82,7 +83,7 @@ class SimpleDocumentUploader:
         else:
             print(f"集合 '{self.collection_name}' 已存在")
 
-        self.collection = Collection(name=self.collection_name)
+        self.collection = Collection(name=self.collection_name, using=self.alias)
 
     def insert_data(self, names, texts, embeddings):
         """插入数据到Milvus"""
@@ -168,7 +169,7 @@ def main():
 
         # 显示集合信息
         try:
-            collection = Collection(name=COLLECTION_NAME)
+            collection = Collection(name=COLLECTION_NAME, using="default")
             count = collection.num_entities
             print(f"集合 '{COLLECTION_NAME}' 中共有 {count} 条记录")
         except Exception as e:

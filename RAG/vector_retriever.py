@@ -4,7 +4,8 @@
 """
 from openai import OpenAI
 import logging
-from typing import List, Dict, Any, Tuple
+import sys
+from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ load_dotenv(dotenv_path=env_path)
 from langchain_core.documents import Document
 
 # 本地模块
-from .vector_db_manager import VectorDatabaseManager
+from vector_db_manager import VectorDatabaseManager
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -57,7 +58,7 @@ class VectorRetriever:
 
     def __init__(self,
                  db_manager: VectorDatabaseManager,
-                 similarity_threshold: float = 0.5,  # 适当调整阈值
+                 similarity_threshold: Optional[float] = None,  # None 表示不过滤
                  max_results: int = 10):
         """
         初始化向量检索器
@@ -70,6 +71,8 @@ class VectorRetriever:
         self.db_manager = db_manager
         self.similarity_threshold = similarity_threshold
         self.max_results = max_results
+        # LangChain + Milvus 默认 score 为距离（L2/IP 等），L2 下越小越相似
+        self.distance_metric = "L2"
 
     def search_similar_content(self,
                                query: str,
@@ -97,11 +100,17 @@ class VectorRetriever:
             # 执行向量搜索
             search_results = self.db_manager.search(query=query, k=k, collection_name=collection_name)
 
-            # 过滤低相似度结果
+            # 阈值过滤（可选）
             results = []
             for doc, score in search_results:
-                if score >= self.similarity_threshold:
+                if self.similarity_threshold is None:
                     results.append((doc, score))
+                elif self.distance_metric == "L2":
+                    if score <= self.similarity_threshold:
+                        results.append((doc, score))
+                else:
+                    if score >= self.similarity_threshold:
+                        results.append((doc, score))
 
             logger.info(f"在集合 '{collection_name}' 中检索查询: '{query}', 返回 {len(results)} 个高质量结果")
             return results
@@ -186,15 +195,27 @@ class VectorRetriever:
 
             client = OpenAI(api_key=api_key, base_url=base_url)
 
-            system_prompt = (
-                "你是一个智能助手。请基于提供的【参考资料】回答用户的问题。\n"
-                "如果参考资料为空或与问题无关，请忽略参考资料，利用你的通用知识进行回答，"
-                "并在回答开头说明：'知识库中未找到相关内容，以下是基于通用知识的回答：'。\n"
-                "回答要简洁、准确、有条理。"
-            )
+            if context.strip():
+                system_prompt = (
+                    "你是知识库问答助手。【参考资料】由向量检索从知识库取出，请优先严格依据其中的文字作答，"
+                    "可做归纳、分点、转述，不要编造资料中不存在的事实。\n"
+                    "不要使用「知识库中未找到相关内容」或「以下基于通用知识」等前缀。\n"
+                    "仅当参考资料与问题主题完全无关时（例如资料只讲 RAG，问题问诺贝尔奖），"
+                    "先一句话说明资料未覆盖该问题，再视情况补充常识。\n"
+                    "回答简洁、准确。"
+                )
+                temperature = 0.2
+            else:
+                system_prompt = (
+                    "你是一个智能助手。当前没有可用的知识库参考资料。\n"
+                    "请用你的通用知识回答，并在开头写："
+                    "「知识库中未找到相关内容，以下是基于通用知识的回答：」。\n"
+                    "回答简洁、准确、有条理。"
+                )
+                temperature = 0.7
 
             user_prompt = f"问题：{question}\n\n"
-            if context:
+            if context.strip():
                 user_prompt += f"【参考资料】：\n{context}"
             else:
                 user_prompt += "【参考资料】：(无)"
@@ -205,7 +226,7 @@ class VectorRetriever:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.7
+                temperature=temperature,
             )
 
             return response.choices[0].message.content
@@ -227,17 +248,16 @@ class VectorRetriever:
         if not scores:
             return 0.0
 
-        # 基于最高相似度分数和结果数量计算置信度
-        max_score = max(scores)
-        avg_score = sum(scores) / len(scores)
+        # 检索分数为 Milvus L2 距离：越小越相似，不能当「越大越好」的相似度用
+        def _l2_to_unit_similarity(d: float) -> float:
+            return 1.0 / (1.0 + float(d) / 5000.0)
 
-        # 结果数量权重
+        sims = [_l2_to_unit_similarity(s) for s in scores]
+        best_sim = max(sims)
+        avg_sim = sum(sims) / len(sims)
         count_weight = min(len(scores) / 5.0, 1.0)
-
-        # 综合置信度
-        confidence = (max_score * 0.6 + avg_score * 0.4) * count_weight
-
-        return min(confidence, 1.0)
+        confidence = (best_sim * 0.6 + avg_sim * 0.4) * count_weight
+        return min(max(confidence, 0.0), 1.0)
 
     def get_statistics(self, collection_name: str) -> Dict[str, Any]:
         """
@@ -269,6 +289,11 @@ class QuestionClassifier:
 
 def main():
     """测试函数"""
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+
     # 初始化 Milvus 连接
     try:
         db_manager = VectorDatabaseManager(
@@ -283,19 +308,19 @@ def main():
         return
 
     # 准备测试数据
-    info = db_manager.get_database_info()
+    info = db_manager.get_database_info(collection_name=collection_name)
     if not info.get("is_initialized"):
         print(f"集合 '{collection_name}' 不存在，正在创建并添加数据...")
         # 此处可以添加一个示例文件上传的逻辑
         # 例如: db_manager.process_file("path/to/your/data.csv", collection_name)
         print("请先手动上传数据以进行测试。")
-        # return # 如果没有数据，可以选择退出
+    else:
+        print(f"集合 '{collection_name}' 已就绪，文档数: {info.get('document_count', 'unknown')}")
 
     # 测试问题回答
     test_questions = [
-        "Milvus 是什么？",
-        "如何将文本上传到向量数据库？",
-        "RAG 工作流程的关键步骤是什么？"
+        "吕心炜是谁？"
+
     ]
 
     print("\n--- 测试问答功能 ---")

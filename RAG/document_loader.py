@@ -264,13 +264,23 @@ class DocumentLoader:
             import pandas as pd
             df = pd.read_csv(csv_path, encoding=self.encoding)
             logger.info(f"读取CSV文件: {csv_path}, 共 {len(df)} 行数据")
+            # 标准化列名，避免前后空格导致列匹配失败
+            df.columns = [str(c).strip() for c in df.columns]
 
             if text_columns is None or not text_columns:
                 object_cols = [c for c in df.columns if df[c].dtype == 'object']
                 text_columns = [c for c in object_cols if not str(c).startswith('Unnamed')]
+                # 兜底：若未识别到 object 列，使用全部有效列，避免“有数据但构建 0 文档”
+                if not text_columns:
+                    text_columns = [c for c in df.columns if not str(c).startswith('Unnamed')]
+            else:
+                # 用户显式传入时，清洗并过滤不存在列
+                text_columns = [str(c).strip() for c in text_columns if str(c).strip() in df.columns]
 
             if metadata_columns is None:
                 metadata_columns = [c for c in df.columns if c not in text_columns]
+            else:
+                metadata_columns = [str(c).strip() for c in metadata_columns if str(c).strip() in df.columns]
 
             documents = []
             for idx, row in df.iterrows():
@@ -336,7 +346,7 @@ def main():
     loader = DocumentLoader()
 
     # 测试加载学术CSV数据
-    csv_path = "../data.csv"
+    csv_path = "./data.csv" 
     if os.path.exists(csv_path):
         documents = loader.load_academic_csv(csv_path)
         print(f"加载了 {len(documents)} 个文档")

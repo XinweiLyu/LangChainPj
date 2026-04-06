@@ -36,7 +36,7 @@ from langchain_community.document_loaders import (
     Docx2txtLoader,
     UnstructuredExcelLoader
 )
-from pymilvus import utility, connections, Collection
+from pymilvus import utility, connections, Collection, DataType
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -69,6 +69,7 @@ class VectorDatabaseManager:
         self.milvus_host = milvus_host or os.getenv("MILVUS_HOST", "127.0.0.1")
         # Ensure port is a string as pymilvus might expect it, or handle int gracefully
         self.milvus_port = str(milvus_port or os.getenv("MILVUS_PORT", "19530"))
+        self.milvus_alias = "default"
         self.collection_name = collection_name or os.getenv("COLLECTION_NAME", "agent_rag")
         self.embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL", "text-embedding-v1")
         self.dashscope_api_key = dashscope_api_key or os.getenv("DASHSCOPE_API_KEY", "")
@@ -127,22 +128,151 @@ class VectorDatabaseManager:
         """连接到Milvus服务"""
         try:
             logger.info(f"Connecting to Milvus: host={self.milvus_host}, port={self.milvus_port}")
-            connections.connect("default", host=self.milvus_host, port=self.milvus_port)
-            logger.info(f"成功连接到Milvus: {self.milvus_host}:{self.milvus_port}")
+            connections.connect(alias="default", host=self.milvus_host, port=self.milvus_port)
+            logger.info(f"成功连接到Milvus: {self.milvus_host}:{self.milvus_port}, alias=default")
         except Exception as e:
             logger.error(f"连接Milvus失败: {e}")
             raise
 
+    def _ensure_connection(self):
+        """确保 default 连接可用；若断开则自动重连。"""
+        try:
+            # 先检查 alias 是否存在，再用一次轻量操作验证连接真的可用
+            addr = connections.get_connection_addr("default")
+            if not addr:
+                raise RuntimeError("Milvus alias=default 连接地址为空")
+            utility.list_collections(timeout=3, using="default")
+        except Exception:
+            self._connect_to_milvus()
+
+    def _connection_args(self) -> Dict[str, str]:
+        """供 LangChain Milvus 使用（当前 pymilvus 2.6 + langchain_milvus 在 __init__ 中有 ORM 别名 bug）。"""
+        return {"host": self.milvus_host, "port": self.milvus_port, "alias": "default"}
+
+    def _infer_orm_search_schema(self, col: Collection) -> Tuple[str, str, str]:
+        """
+        从集合 schema 推断向量字段、文本字段与 metric_type（用于 ORM search）。
+        """
+        vector_field: Optional[str] = None
+        varchar_specs: List[Tuple[str, int]] = []
+
+        for field in col.schema.fields:
+            if field.dtype == DataType.FLOAT_VECTOR:
+                vector_field = field.name
+            elif field.dtype in (DataType.VARCHAR, DataType.JSON):
+                varchar_specs.append(
+                    (field.name, int(field.params.get("max_length", 0) or 0))
+                )
+
+        if not vector_field:
+            raise ValueError("集合中未找到 FLOAT_VECTOR 字段，无法检索")
+
+        text_field: Optional[str] = None
+        for preferred in ("text", "langchain_text", "page_content"):
+            if any(n == preferred for n, _ in varchar_specs):
+                text_field = preferred
+                break
+        if text_field is None and varchar_specs:
+            varchar_specs.sort(key=lambda x: -x[1])
+            text_field = varchar_specs[0][0]
+
+        if text_field is None:
+            raise ValueError("集合中未找到可用的文本字段（VARCHAR）")
+
+        metric_type = "L2"
+        for idx in col.indexes:
+            if idx.field_name == vector_field and idx.params:
+                metric_type = idx.params.get("metric_type") or metric_type
+                break
+
+        return vector_field, text_field, metric_type
+
+    def _entity_row_to_dict(self, entity: Any, field_names: List[str]) -> Dict[str, Any]:
+        """将 search 返回的 entity 转为 dict。"""
+        row: Dict[str, Any] = {}
+        if entity is None:
+            return row
+        if hasattr(entity, "to_dict"):
+            d = entity.to_dict()
+            if isinstance(d, dict):
+                # pymilvus 2.6：Hit.to_dict() 常为
+                # {id, distance, entity: {name, text, ...}}，标量字段在嵌套 entity 里
+                inner = d.get("entity")
+                src: Dict[str, Any] = inner if isinstance(inner, dict) else d
+                return {k: src.get(k) for k in field_names}
+        for name in field_names:
+            try:
+                if hasattr(entity, "get"):
+                    row[name] = entity.get(name)
+                else:
+                    row[name] = getattr(entity, name, None)
+            except Exception:
+                row[name] = None
+        return row
+
+    def _search_via_orm(
+        self, query: str, k: int, collection_name: str
+    ) -> List[Tuple[Document, float]]:
+        """
+        使用 pymilvus ORM（default 连接）检索，规避 langchain_milvus 与 MilvusClient 的别名不一致问题。
+        """
+        self._ensure_connection()
+        col = Collection(collection_name, using="default")
+
+        vector_field, text_field, metric_type = self._infer_orm_search_schema(col)
+        output_fields: List[str] = []
+        for f in col.schema.fields:
+            if f.name == vector_field:
+                continue
+            output_fields.append(f.name)
+
+        col.load()
+        query_vector = self.embeddings.embed_query(query)
+        search_params = {"metric_type": metric_type, "params": {"nprobe": 10}}
+
+        raw = col.search(
+            data=[query_vector],
+            anns_field=vector_field,
+            param=search_params,
+            limit=k,
+            output_fields=output_fields,
+        )
+
+        results: List[Tuple[Document, float]] = []
+        for hits in raw:
+            for hit in hits:
+                row = self._entity_row_to_dict(hit.entity, output_fields)
+                page = row.get(text_field)
+                page_content = "" if page is None else str(page)
+                metadata = {k: v for k, v in row.items() if k != text_field}
+                results.append((Document(page_content=page_content, metadata=metadata), float(hit.distance)))
+        return results
+
+    def _has_collection_with_retry(self, collection_name: str) -> bool:
+        """检查集合是否存在；若连接短暂失效则重连后重试一次。"""
+        try:
+            self._ensure_connection()
+            return utility.has_collection(collection_name, using="default")
+        except Exception as first_error:
+            logger.warning(f"检查集合存在性失败，准备重试: {first_error}")
+            try:
+                self._connect_to_milvus()
+                return utility.has_collection(collection_name, using="default")
+            except Exception as retry_error:
+                logger.error(f"重试检查集合失败: {retry_error}")
+                return False
+
     def _load_existing_db(self):
         """加载已存在的Milvus集合"""
         try:
+            self._ensure_connection()
             # 检查集合是否存在
-            if utility.has_collection(self.collection_name):
+            if self._has_collection_with_retry(self.collection_name):
                 try:
                     self.vectorstore = Milvus(
                         embedding_function=self.embeddings,
                         collection_name=self.collection_name,
-                        connection_args={"host": self.milvus_host, "port": self.milvus_port}
+                        connection_args=self._connection_args()
                     )
                     logger.info(f"成功加载现有Milvus集合: {self.collection_name}")
                 except Exception as e:
@@ -213,8 +343,9 @@ class VectorDatabaseManager:
         target_collection = collection_name or self.collection_name
 
         try:
+            self._ensure_connection()
             # 检查集合是否存在
-            collection_exists = utility.has_collection(target_collection)
+            collection_exists = self._has_collection_with_retry(target_collection)
 
             if self.vectorstore is None or self.collection_name != target_collection:
                 # 初始化 vectorstore
@@ -238,7 +369,7 @@ class VectorDatabaseManager:
                     self.vectorstore = Milvus(
                         embedding_function=self.embeddings,
                         collection_name=target_collection,
-                        connection_args={"host": self.milvus_host, "port": self.milvus_port},
+                        connection_args=self._connection_args(),
                         # 关键：auto_id=True 通常是默认的，但确保配置一致
                     )
                     self.collection_name = target_collection
@@ -251,7 +382,7 @@ class VectorDatabaseManager:
                         documents=documents,
                         embedding=self.embeddings,
                         collection_name=target_collection,
-                        connection_args={"host": self.milvus_host, "port": self.milvus_port},
+                        connection_args=self._connection_args(),
                         drop_old=False  # 明确不删除旧的（虽然这里是else分支，本身就不存在）
                     )
                     self.collection_name = target_collection
@@ -267,14 +398,14 @@ class VectorDatabaseManager:
             if "non-exist field" in msg or "inconsistent with defined schema" in msg:
                 logger.warning(f"检测到 Schema 不兼容 ({e})，尝试重建集合...")
                 try:
-                    if utility.has_collection(target_collection):
+                    if self._has_collection_with_retry(target_collection):
                         utility.drop_collection(target_collection)
 
                     self.vectorstore = Milvus.from_documents(
                         documents=documents,
                         embedding=self.embeddings,
                         collection_name=target_collection,
-                        connection_args={"host": self.milvus_host, "port": self.milvus_port},
+                        connection_args=self._connection_args(),
                         drop_old=True
                     )
                     self.collection_name = target_collection
@@ -399,34 +530,23 @@ class VectorDatabaseManager:
             (文档, 相似度分数) 列表
         """
         target_collection = collection_name or self.collection_name
-        # 如果vectorstore未初始化，或者target_collection和collection_name不匹配，则加载集合
-        if self.vectorstore is None or (target_collection and self.collection_name != target_collection):
-            try:
-                if target_collection and utility.has_collection(target_collection):
-                    self.vectorstore = Milvus(
-                        embedding_function=self.embeddings,
-                        collection_name=target_collection,
-                        connection_args={"host": self.milvus_host, "port": self.milvus_port}
-                    )
-                    self.collection_name = target_collection
-                    logger.info(f"加载集合用于搜索: {target_collection}")
-                else:
-                    logger.warning("向量数据库未初始化")
-                    return []
-            except Exception as e:
-                logger.error(f"加载Milvus集合失败: {e}")
-                return []
+        self._ensure_connection()
+        if filter_dict:
+            logger.warning("Milvus集成当前不支持直接的元数据过滤，该过滤器将被忽略。")
+
+        if not target_collection or not self._has_collection_with_retry(target_collection):
+            logger.warning("向量数据库未初始化或集合不存在")
+            return []
 
         try:
-            if filter_dict:
-                logger.warning("Milvus集成当前不支持直接的元数据过滤，该过滤器将被忽略。")
-
-            results = self.vectorstore.similarity_search_with_score(query=query, k=k)
+            # 使用 ORM default 连接检索。langchain_milvus.Milvus 在 pymilvus 2.6 下会因
+            # MilvusClient._using（cm-xxx）与 ORM connections 不一致而在 __init__ 中报错。
+            results = self._search_via_orm(query, k, target_collection)
+            self.collection_name = target_collection
             logger.info(f"搜索查询: '{query}', 返回 {len(results)} 个结果")
             return results
-
         except Exception as e:
-            logger.error(f"搜索失败: {e}")
+            logger.exception(f"搜索失败: {e}")
             return []
 
     def get_database_info(self, collection_name: str = None) -> Dict[str, Any]:
@@ -443,25 +563,18 @@ class VectorDatabaseManager:
         }
 
         try:
+            self._ensure_connection()
             # 如果 vectorstore 未初始化，尝试临时连接检查
-            if utility.has_collection(target_collection):
+            if self._has_collection_with_retry(target_collection):
                 # 使用 Collection 对象获取统计信息
-                col = Collection(target_collection)
+                col = Collection(target_collection, using="default")
                 # 刷新以确保获取最新数据量（刚插入的数据可能还在内存中）
                 col.flush()
                 info["document_count"] = col.num_entities
+                # 集合存在即可视为已初始化（不强依赖 self.vectorstore 当前是否已绑定）
+                info["is_initialized"] = True
 
-                # 如果 self.vectorstore 为空但集合存在，尝试初始化它（如果还没做过）
-                if self.vectorstore is None:
-                    try:
-                        self.vectorstore = Milvus(
-                            embedding_function=self.embeddings,
-                            collection_name=target_collection,
-                            connection_args={"host": self.milvus_host, "port": self.milvus_port}
-                        )
-                        info["is_initialized"] = True
-                    except:
-                        pass  # 忽略加载错误，只返回统计
+                # 检索已改为 ORM 直连，不再依赖 langchain_milvus.Milvus 实例
             else:
                 info["document_count"] = 0
         except Exception as e:
@@ -473,7 +586,8 @@ class VectorDatabaseManager:
     def clear_database(self):
         """清空Milvus集合"""
         try:
-            if utility.has_collection(self.collection_name):
+            self._ensure_connection()
+            if self._has_collection_with_retry(self.collection_name):
                 utility.drop_collection(self.collection_name)
                 self.vectorstore = None
                 logger.info(f"Milvus集合 '{self.collection_name}' 已被删除")
@@ -485,9 +599,10 @@ def main():
     """测试函数"""
     # 确保Milvus服务正在运行
     try:
-        connections.connect("default", host="127.0.0.1", port=19530)
-        utility.get_collection_stats("agent_rag")
-        connections.disconnect("default")
+        test_alias = "default"
+        connections.connect(alias=test_alias, host="127.0.0.1", port=19530)
+        utility.get_collection_stats("agent_rag", using=test_alias)
+        connections.disconnect(alias=test_alias)
     except Exception as e:
         logger.error("无法连接到Milvus服务，请确保您已通过 docker-compose up -d 启动了Milvus。")
         logger.error(f"错误: {e}")
