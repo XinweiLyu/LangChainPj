@@ -25,22 +25,22 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class RetrievalResult:
-    """检索结果数据类"""
-    content: str 
-    score: float 
-    metadata: Dict[str, Any]
-    source: str
-
-    def to_dict(self) -> Dict[str, Any]:
-        """转换为字典格式"""
-        return {
-            "content": self.content,
-            "score": self.score,
-            "metadata": self.metadata,
-            "source": self.source
-        }
+# @dataclass
+# class RetrievalResult:
+#     """检索结果数据类"""
+#     content: str
+#     score: float
+#     metadata: Dict[str, Any]
+#     source: str
+#
+#     def to_dict(self) -> Dict[str, Any]:
+#         """转换为字典格式"""
+#         return {
+#             "content": self.content,
+#             "score": self.score,
+#             "metadata": self.metadata,
+#             "source": self.source
+#         }
 
 
 @dataclass
@@ -259,26 +259,26 @@ class VectorRetriever:
         confidence = (best_sim * 0.6 + avg_sim * 0.4) * count_weight
         return min(max(confidence, 0.0), 1.0)
 
-    def get_statistics(self, collection_name: str) -> Dict[str, Any]:
-        """
-        获取检索统计信息
-
-        Args:
-            collection_name: Milvus 集合名称
-
-        Returns:
-            统计信息字典
-        """
-        db_info = self.db_manager.get_database_info()
-
-        stats = {
-            "database_info": db_info,
-            "similarity_threshold": self.similarity_threshold,
-            "max_results": self.max_results,
-            "retriever_status": "active" if db_info.get("is_initialized") else "inactive"
-        }
-
-        return stats
+    # def get_statistics(self, collection_name: str) -> Dict[str, Any]:
+    #     """
+    #     获取检索统计信息
+    #
+    #     Args:
+    #         collection_name: Milvus 集合名称
+    #
+    #     Returns:
+    #         统计信息字典
+    #     """
+    #     db_info = self.db_manager.get_database_info()
+    #
+    #     stats = {
+    #         "database_info": db_info,
+    #         "similarity_threshold": self.similarity_threshold,
+    #         "max_results": self.max_results,
+    #         "retriever_status": "active" if db_info.get("is_initialized") else "inactive"
+    #     }
+    #
+    #     return stats
 
 
 class QuestionClassifier:

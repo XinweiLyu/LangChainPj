@@ -58,7 +58,7 @@ def init_vector_system(
         logger.error(f"向量系统初始化失败: {str(e)}")
         return False
 
-
+# test
 @vector_bp.route('/upload_document', methods=['POST'])
 def upload_document():
     """上传并处理文档
@@ -72,7 +72,7 @@ def upload_document():
             'message': '向量系统未初始化'
         }), 400
 
-    try:
+    try:# 处理本地文件路径并入库（后端机器上已有文件）
         data = request.get_json()
         if not data or 'file_path' not in data or 'collection_name' not in data:
             return jsonify({
@@ -212,7 +212,7 @@ def query_documents():
             'message': f'查询失败: {str(e)}'
         }), 500
 
-
+#test
 @vector_bp.route('/search', methods=['POST'])
 def search_similar():
     """相似性搜索
@@ -261,7 +261,7 @@ def search_similar():
             'message': f'搜索失败: {str(e)}'
         }), 500
 
-
+#test
 @vector_bp.route('/collection_info', methods=['GET'])
 def get_collection_info():
     """获取集合信息
@@ -296,7 +296,7 @@ def get_collection_info():
             'message': f'获取数据库信息失败: {str(e)}'
         }), 500
 
-
+# test
 @vector_bp.route('/clear_collection', methods=['POST'])
 def clear_collection():
     """清空集合"""
